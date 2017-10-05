@@ -1,0 +1,96 @@
+syntax = "proto2";
+
+package mesos;
+
+// The Subscribe service definition.
+service Subscribe {
+// Sends a request to register with the master
+    rpc SubFramework (SubRequest) returns (stream SubReply) {}
+}
+
+// // The request message containing the FW's info.
+// message SubRequest {
+//     // Commenting `type` out as it looks like Mesos doesn't explicitly have it here
+//     required string type = 1;
+//     required FrameworkInfo framework = 2;
+//     }
+// From Mesos 1.3.0
+// message Call {
+message SubRequest {
+    // Possible call types, followed by message definitions if
+    // applicable.
+    enum Type {
+      // See comments above on `Event::Type` for more details on this enum value.
+      UNKNOWN = 0;
+  
+      SUBSCRIBE = 1;   // See 'Subscribe' below.
+      TEARDOWN = 2;    // Shuts down all tasks/executors and removes framework.
+      ACCEPT = 3;      // See 'Accept' below.
+      DECLINE = 4;     // See 'Decline' below.
+      ACCEPT_INVERSE_OFFERS = 13;  // See 'AcceptInverseOffers' below.
+      DECLINE_INVERSE_OFFERS = 14; // See 'DeclineInverseOffers' below.
+      REVIVE = 5;      // Removes any previous filters set via ACCEPT or DECLINE.
+      KILL = 6;        // See 'Kill' below.
+      SHUTDOWN = 7;    // See 'Shutdown' below.
+      ACKNOWLEDGE = 8; // See 'Acknowledge' below.
+      RECONCILE = 9;   // See 'Reconcile' below.
+      MESSAGE = 10;    // See 'Message' below.
+      REQUEST = 11;    // See 'Request' below.
+      SUPPRESS = 12;   // Inform master to stop sending offers to the framework.
+
+    }
+  
+    // Subscribes the scheduler with the master to receive events. A
+    // scheduler must send other calls only after it has received the
+    // SUBCRIBED event.
+    message Subscribe {
+      // See the comments below on 'framework_id' on the semantics for
+      // 'framework_info.id'.
+      required FrameworkInfo framework_info = 1;
+    }
+
+  
+    // Type of the call, indicates which optional field below should be
+    // present if that type has a nested message definition.
+    // See comments on `Event::Type` above on the reasoning behind this field being optional.
+    optional Type type = 2;
+  
+    optional Subscribe subscribe = 3;
+    
+  }
+  /**
+ * Describes a framework.
+ */
+message FrameworkInfo {
+    // Used to determine the Unix user that an executor or task should be
+    // launched as.
+    //
+    // When using the MesosSchedulerDriver, if the field is set to an
+    // empty string, it will automagically set it to the current user.
+    //
+    // When using the HTTP Scheduler API, the user has to be set
+    // explicitly.
+    required string user = 1;
+  
+    // Name of the framework that shows up in the Mesos Web UI.
+    required string name = 2;
+  
+  }
+// Commenting out my original definition to troubleshoot
+// message FrameworkInfo {    
+//     string user = 1;
+//     string name = 2;
+//     double failover_timeout = 4;
+//     bool checkpoint = 5;
+//     string role = 6;
+//     string hostname = 7;
+//     string principal = 8;
+//     string webui_url = 9;  
+//     repeated string roles = 12;
+    
+// }
+
+// The response message containing the greetings
+message SubReply {
+    required string response = 1;
+}
