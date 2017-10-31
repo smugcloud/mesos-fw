@@ -7,15 +7,241 @@ service Subscribe {
 // Sends a request to register with the master
     rpc SubFramework (SubRequest) returns (stream SubReply) {}
 }
+message Call {
+  // Possible call types, followed by message definitions if
+  // applicable.
+  enum Type {
+    // See comments above on `Event::Type` for more details on this enum value.
+    UNKNOWN = 0;
 
+    SUBSCRIBE = 1;   // See 'Subscribe' below.
+    TEARDOWN = 2;    // Shuts down all tasks/executors and removes framework.
+    ACCEPT = 3;      // See 'Accept' below.
+    DECLINE = 4;     // See 'Decline' below.
+    ACCEPT_INVERSE_OFFERS = 13;  // See 'AcceptInverseOffers' below.
+    DECLINE_INVERSE_OFFERS = 14; // See 'DeclineInverseOffers' below.
+    REVIVE = 5;      // Removes any previous filters set via ACCEPT or DECLINE.
+    KILL = 6;        // See 'Kill' below.
+    SHUTDOWN = 7;    // See 'Shutdown' below.
+    ACKNOWLEDGE = 8; // See 'Acknowledge' below.
+    RECONCILE = 9;   // See 'Reconcile' below.
+    MESSAGE = 10;    // See 'Message' below.
+    REQUEST = 11;    // See 'Request' below.
+    SUPPRESS = 12;   // Inform master to stop sending offers to the framework.
+
+    // TODO(benh): Consider adding an 'ACTIVATE' and 'DEACTIVATE' for
+    // already subscribed frameworks as a way of stopping offers from
+    // being generated and other events from being sent by the master.
+    // Note that this functionality existed originally to support
+    // SchedulerDriver::abort which was only necessary to handle
+    // exceptions getting thrown from within Scheduler callbacks,
+    // something that is not an issue with the Event/Call API.
+  }
+
+  // Subscribes the scheduler with the master to receive events. A
+  // scheduler must send other calls only after it has received the
+  // SUBCRIBED event.
+  message Subscribe {
+    // See the comments below on 'framework_id' on the semantics for
+    // 'framework_info.id'.
+    required FrameworkInfo framework_info = 1;
+
+    // List of suppressed roles for which the framework does not wish to be
+    // offered resources. The framework can decide to suppress all or a subset
+    // of roles the framework (re)registers as.
+    repeated string suppressed_roles = 2;
+  }
+
+  // Accepts an offer, performing the specified operations
+  // in a sequential manner.
+  //
+  // E.g. Launch a task with a newly reserved persistent volume:
+  //
+  //   Accept {
+  //     offer_ids: [ ... ]
+  //     operations: [
+  //       { type: RESERVE,
+  //         reserve: { resources: [ disk(role):2 ] } }
+  //       { type: CREATE,
+  //         create: { volumes: [ disk(role):1+persistence ] } }
+  //       { type: LAUNCH,
+  //         launch: { task_infos ... disk(role):1;disk(role):1+persistence } }
+  //     ]
+  //   }
+  //
+  // Note that any of the offer’s resources not used in the 'Accept'
+  // call (e.g., to launch a task) are considered unused and might be
+  // reoffered to other frameworks. In other words, the same OfferID
+  // cannot be used in more than one 'Accept' call.
+  message Accept {
+    repeated OfferID offer_ids = 1;
+    repeated Offer.Operation operations = 2;
+    optional Filters filters = 3;
+  }
+
+  // Declines an offer, signaling the master to potentially reoffer
+  // the resources to a different framework. Note that this is same
+  // as sending an Accept call with no operations. See comments on
+  // top of 'Accept' for semantics.
+  message Decline {
+    repeated OfferID offer_ids = 1;
+    optional Filters filters = 2;
+  }
+
+  // Accepts an inverse offer. Inverse offers should only be accepted
+  // if the resources in the offer can be safely evacuated before the
+  // provided unavailability.
+  message AcceptInverseOffers {
+    repeated OfferID inverse_offer_ids = 1;
+    optional Filters filters = 2;
+  }
+
+  // Declines an inverse offer. Inverse offers should be declined if
+  // the resources in the offer might not be safely evacuated before
+  // the provided unavailability.
+  message DeclineInverseOffers {
+    repeated OfferID inverse_offer_ids = 1;
+    optional Filters filters = 2;
+  }
+
+  // Revive offers for the specified roles. If `roles` is empty,
+  // the `REVIVE` call will revive offers for all of the roles
+  // the framework is currently subscribed to.
+  message Revive {
+    repeated string roles = 1;
+  }
+
+  // Kills a specific task. If the scheduler has a custom executor,
+  // the kill is forwarded to the executor and it is up to the
+  // executor to kill the task and send a TASK_KILLED (or TASK_FAILED)
+  // update. Note that Mesos releases the resources for a task once it
+  // receives a terminal update (See TaskState in v1/mesos.proto) for
+  // it. If the task is unknown to the master, a TASK_LOST update is
+  // generated.
+  //
+  // If a task within a task group is killed before the group is
+  // delivered to the executor, all tasks in the task group are
+  // killed. When a task group has been delivered to the executor,
+  // it is up to the executor to decide how to deal with the kill.
+  // Note The default Mesos executor will currently kill all the
+  // tasks in the task group if it gets a kill for any task.
+  message Kill {
+    required TaskID task_id = 1;
+    optional AgentID agent_id = 2;
+
+    // If set, overrides any previously specified kill policy for this task.
+    // This includes 'TaskInfo.kill_policy' and 'Executor.kill.kill_policy'.
+    // Can be used to forcefully kill a task which is already being killed.
+    optional KillPolicy kill_policy = 3;
+  }
+
+  // Shuts down a custom executor. When the executor gets a shutdown
+  // event, it is expected to kill all its tasks (and send TASK_KILLED
+  // updates) and terminate. If the executor doesn’t terminate within
+  // a certain timeout (configurable via
+  // '--executor_shutdown_grace_period' agent flag), the agent will
+  // forcefully destroy the container (executor and its tasks) and
+  // transition its active tasks to TASK_LOST.
+  message Shutdown {
+    required ExecutorID executor_id = 1;
+    required AgentID agent_id = 2;
+  }
+
+  // Acknowledges the receipt of status update. Schedulers are
+  // responsible for explicitly acknowledging the receipt of status
+  // updates that have 'Update.status().uuid()' field set. Such status
+  // updates are retried by the agent until they are acknowledged by
+  // the scheduler.
+  message Acknowledge {
+    required AgentID agent_id = 1;
+    required TaskID task_id = 2;
+    required bytes uuid = 3;
+  }
+
+  // Allows the scheduler to query the status for non-terminal tasks.
+  // This causes the master to send back the latest task status for
+  // each task in 'tasks', if possible. Tasks that are no longer known
+  // will result in a TASK_LOST, TASK_UNKNOWN, or TASK_UNREACHABLE update.
+  // If 'tasks' is empty, then the master will send the latest status
+  // for each task currently known.
+  message Reconcile {
+    // TODO(vinod): Support arbitrary queries than just state of tasks.
+    message Task {
+      required TaskID task_id = 1;
+      optional AgentID agent_id = 2;
+    }
+
+    repeated Task tasks = 1;
+  }
+
+  // Sends arbitrary binary data to the executor. Note that Mesos
+  // neither interprets this data nor makes any guarantees about the
+  // delivery of this message to the executor.
+  message Message {
+    required AgentID agent_id = 1;
+    required ExecutorID executor_id = 2;
+    required bytes data = 3;
+  }
+
+  // Requests a specific set of resources from Mesos's allocator. If
+  // the allocator has support for this, corresponding offers will be
+  // sent asynchronously via the OFFERS event(s).
+  //
+  // NOTE: The built-in hierarchical allocator doesn't have support
+  // for this call and hence simply ignores it.
+  // message Request {
+  //   repeated mesos.v1.Request requests = 1;
+  // }
+
+  // Suppress offers for the specified roles. If `roles` is empty,
+  // the `SUPPRESS` call will suppress offers for all of the roles
+  // the framework is currently subscribed to.
+  message Suppress {
+    repeated string roles = 1;
+  }
+
+  // Identifies who generated this call. Master assigns a framework id
+  // when a new scheduler subscribes for the first time. Once assigned,
+  // the scheduler must set the 'framework_id' here and within its
+  // FrameworkInfo (in any further 'Subscribe' calls). This allows the
+  // master to identify a scheduler correctly across disconnections,
+  // failovers, etc.
+  optional FrameworkID framework_id = 1;
+
+  // Type of the call, indicates which optional field below should be
+  // present if that type has a nested message definition.
+  // See comments on `Event::Type` above on the reasoning behind this field being optional.
+  optional Type type = 2;
+
+  optional Subscribe subscribe = 3;
+  optional Accept accept = 4;
+  optional Decline decline = 5;
+  optional AcceptInverseOffers accept_inverse_offers = 13;
+  optional DeclineInverseOffers decline_inverse_offers = 14;
+  optional Revive revive = 15;
+  optional Kill kill = 6;
+  optional Shutdown shutdown = 7;
+  optional Acknowledge acknowledge = 8;
+  optional Reconcile reconcile = 9;
+  optional Message message = 10;
+  // optional Request request = 11;
+  optional Suppress suppress = 16;
+}
+
+message KillPolicy {
+  // The grace period specifies how long to wait before forcibly
+  // killing the task. It is recommended to attempt to gracefully
+  // kill the task (and send TASK_KILLING) to indicate that the
+  // graceful kill is in progress. Once the grace period elapses,
+  // if the task has not terminated, a forcible kill should occur.
+  // The task should not assume that it will always be allotted
+  // the full grace period. For example, the executor may be
+  // shutdown more quickly by the agent, or failures / forcible
+  // terminations may occur.
+  optional DurationInfo grace_period = 1;
+}
 // // The request message containing the FW's info.
-// message SubRequest {
-//     // Commenting `type` out as it looks like Mesos doesn't explicitly have it here
-//     required string type = 1;
-//     required FrameworkInfo framework = 2;
-//     }
-// From Mesos 1.3.0
-// message Call {
+
 message SubRequest {
     // Possible call types, followed by message definitions if
     // applicable.
@@ -76,21 +302,1362 @@ message FrameworkInfo {
     required string name = 2;
   
   }
-// Commenting out my original definition to troubleshoot
-// message FrameworkInfo {    
-//     string user = 1;
-//     string name = 2;
-//     double failover_timeout = 4;
-//     bool checkpoint = 5;
-//     string role = 6;
-//     string hostname = 7;
-//     string principal = 8;
-//     string webui_url = 9;  
-//     repeated string roles = 12;
-    
-// }
 
 // The response message containing the greetings
 message SubReply {
     required string response = 1;
+}
+
+message Accept {
+  enum Type {
+    // See comments above on `Event::Type` for more details on this enum value.
+    UNKNOWN = 0;
+
+    SUBSCRIBE = 1;   // See 'Subscribe' below.
+    TEARDOWN = 2;    // Shuts down all tasks/executors and removes framework.
+    ACCEPT = 3;      // See 'Accept' below.
+    DECLINE = 4;     // See 'Decline' below.
+    ACCEPT_INVERSE_OFFERS = 13;  // See 'AcceptInverseOffers' below.
+    DECLINE_INVERSE_OFFERS = 14; // See 'DeclineInverseOffers' below.
+    REVIVE = 5;      // Removes any previous filters set via ACCEPT or DECLINE.
+    KILL = 6;        // See 'Kill' below.
+    SHUTDOWN = 7;    // See 'Shutdown' below.
+    ACKNOWLEDGE = 8; // See 'Acknowledge' below.
+    RECONCILE = 9;   // See 'Reconcile' below.
+    MESSAGE = 10;    // See 'Message' below.
+    REQUEST = 11;    // See 'Request' below.
+    SUPPRESS = 12;   // Inform master to stop sending offers to the framework.
+
+  }
+  required AcceptSub accept =1;
+  optional Filters filters = 3;
+  required FrameworkID framework_id =4;
+  optional Type type = 5;
+  
+}
+
+message AcceptSub {
+  repeated OfferID offer_ids = 1;
+  repeated Offer.Operation operations = 2;
+}
+message OfferID {
+  required string value = 1;
+}
+
+message Value {
+  enum Type {
+    SCALAR = 0;
+    RANGES = 1;
+    SET = 2;
+    TEXT = 3;
+  }
+
+  message Scalar {
+    // Scalar values are represented using floating point. To reduce
+    // the chance of unpredictable floating point behavior due to
+    // roundoff error, Mesos only supports three decimal digits of
+    // precision for scalar resource values. That is, floating point
+    // values are converted to a fixed point format that supports
+    // three decimal digits of precision, and then converted back to
+    // floating point on output. Any additional precision in scalar
+    // resource values is discarded (via rounding).
+    required double value = 1;
+  }
+
+  message Range {
+    required uint64 begin = 1;
+    required uint64 end = 2;
+  }
+
+  message Ranges {
+    repeated Range range = 1;
+  }
+
+  message Set {
+    repeated string item = 1;
+  }
+
+  message Text {
+    required string value = 1;
+  }
+
+  required Type type = 1;
+  optional Scalar scalar = 2;
+  optional Ranges ranges = 3;
+  optional Set set = 4;
+  optional Text text = 5;
+}
+
+message Image {
+  enum Type {
+    APPC = 1;
+    DOCKER = 2;
+  }
+
+  // Protobuf for specifying an Appc container image. See:
+  // https://github.com/appc/spec/blob/master/spec/aci.md
+  message Appc {
+    // The name of the image.
+    required string name = 1;
+
+    // An image ID is a string of the format "hash-value", where
+    // "hash" is the hash algorithm used and "value" is the hex
+    // encoded string of the digest. Currently the only permitted
+    // hash algorithm is sha512.
+    optional string id = 2;
+
+  }
+
+  message Docker {
+    // The name of the image. Expected format:
+    //   [REGISTRY_HOST[:REGISTRY_PORT]/]REPOSITORY[:TAG|@TYPE:DIGEST]
+    //
+    // See: https://docs.docker.com/reference/commandline/pull/
+    required string name = 1;
+
+  }
+
+  required Type type = 1;
+
+  // Only one of the following image messages should be set to match
+  // the type.
+  optional Appc appc = 2;
+  optional Docker docker = 3;
+
+  // With this flag set to false, the mesos containerizer will pull
+  // the docker/appc image from the registry even if the image is
+  // already downloaded on the agent.
+  optional bool cached = 4 [default = true];
+}
+
+message Offer {
+  required OfferID id = 1;
+  required FrameworkID framework_id = 2;
+  required AgentID agent_id = 3;
+  required string hostname = 4;
+
+  repeated Resource resources = 5;
+
+  // Defines an operation that can be performed against offers.
+  message Operation {
+    enum Type {
+      UNKNOWN = 0;
+      LAUNCH = 1;
+      LAUNCH_GROUP = 6;
+      RESERVE = 2;
+      UNRESERVE = 3;
+      CREATE = 4;
+      DESTROY = 5;
+    }
+
+    // TODO(vinod): Deprecate this in favor of `LaunchGroup` below.
+    message Launch {
+      repeated TaskInfo task_infos = 1;
+    }
+
+    optional Type type = 1;
+    optional Launch launch = 2;
+
+  }
+}
+
+message TaskInfo {
+  required string name = 1;
+  required TaskID task_id = 2;
+  required AgentID agent_id = 3;
+  repeated Resource resources = 4;
+  optional CommandInfo command = 7;
+
+  // Task provided with a container will launch the container as part
+  // of this task paired with the task's CommandInfo.
+  optional ContainerInfo container = 9;
+
+}
+
+message ContainerInfo {
+  // All container implementation types.
+  enum Type {
+    DOCKER = 1;
+    MESOS = 2;
+  }
+
+  message DockerInfo {
+    // The docker image that is going to be passed to the registry.
+    required string image = 1;
+
+    // Network options.
+    enum Network {
+      HOST = 1;
+      BRIDGE = 2;
+      NONE = 3;
+      USER = 4;
+    }
+
+    optional Network network = 2 [default = HOST];
+
+    message PortMapping {
+      required uint32 host_port = 1;
+      required uint32 container_port = 2;
+      // Protocol to expose as (ie: tcp, udp).
+      optional string protocol = 3;
+    }
+
+    repeated PortMapping port_mappings = 3;
+
+    optional bool privileged = 4 [default = false];
+
+    // Allowing arbitrary parameters to be passed to docker CLI.
+    // Note that anything passed to this field is not guaranteed
+    // to be supported moving forward, as we might move away from
+    // the docker CLI.
+    repeated Parameter parameters = 5;
+
+    // With this flag set to true, the docker containerizer will
+    // pull the docker image from the registry even if the image
+    // is already downloaded on the agent.
+    optional bool force_pull_image = 6;
+
+    // The name of volume driver plugin.
+    optional string volume_driver = 7 [deprecated = true]; // Since 1.0
+  }
+
+  message MesosInfo {
+    optional Image image = 1;
+  }
+
+  required Type type = 1;
+  optional string hostname = 4;
+
+  // Only one of the following *Info messages should be set to match
+  // the type.
+  optional DockerInfo docker = 3;
+  optional MesosInfo mesos = 5;
+
+}
+message AgentID {
+  required string value = 1;
+}
+
+message CommandInfo {
+  message URI {
+    required string value = 1;
+    optional bool executable = 2;
+
+    // In case the fetched file is recognized as an archive, extract
+    // its contents into the sandbox. Note that a cached archive is
+    // not copied from the cache to the sandbox in case extraction
+    // originates from an archive in the cache.
+    optional bool extract = 3 [default = true];
+
+    // If this field is "true", the fetcher cache will be used. If not,
+    // fetching bypasses the cache and downloads directly into the
+    // sandbox directory, no matter whether a suitable cache file is
+    // available or not. The former directs the fetcher to download to
+    // the file cache, then copy from there to the sandbox. Subsequent
+    // fetch attempts with the same URI will omit downloading and copy
+    // from the cache as long as the file is resident there. Cache files
+    // may get evicted at any time, which then leads to renewed
+    // downloading. See also "docs/fetcher.md" and
+    // "docs/fetcher-cache-internals.md".
+    optional bool cache = 4;
+
+    // The fetcher's default behavior is to use the URI string's basename to
+    // name the local copy. If this field is provided, the local copy will be
+    // named with its value instead. If there is a directory component (which
+    // must be a relative path), the local copy will be stored in that
+    // subdirectory inside the sandbox.
+    optional string output_file = 5;
+  }
+
+
+  // There are two ways to specify the command:
+  // 1) If 'shell == true', the command will be launched via shell
+  //		(i.e., /bin/sh -c 'value'). The 'value' specified will be
+  //		treated as the shell command. The 'arguments' will be ignored.
+  // 2) If 'shell == false', the command will be launched by passing
+  //		arguments to an executable. The 'value' specified will be
+  //		treated as the filename of the executable. The 'arguments'
+  //		will be treated as the arguments to the executable. This is
+  //		similar to how POSIX exec families launch processes (i.e.,
+  //		execlp(value, arguments(0), arguments(1), ...)).
+  // NOTE: The field 'value' is changed from 'required' to 'optional'
+  // in 0.20.0. It will only cause issues if a new framework is
+  // connecting to an old master.
+  optional bool shell = 6 [default = true];
+  optional string value = 3;
+  repeated string arguments = 7;
+
+  // Enables executor and tasks to run as a specific user. If the user
+  // field is present both in FrameworkInfo and here, the CommandInfo
+  // user value takes precedence.
+  optional string user = 5;
+}
+
+message Resource {
+  required string name = 1;
+  required Value.Type type = 2;
+  optional Value.Scalar scalar = 3;
+  optional Value.Ranges ranges = 4;
+  optional Value.Set set = 5;
+
+  // The role that this resource is reserved for. If "*", this indicates
+  // that the resource is unreserved. Otherwise, the resource will only
+  // be offered to frameworks that belong to this role.
+  //
+  // NOTE: Frameworks must not set this field if `reservations` is set.
+  //       See the 'Resource Format' section for more details.
+  //
+  // TODO(mpark): Deprecate once `reservations` is no longer experimental.
+  optional string role = 6 [default = "*", deprecated=true];
+
+  // This was initially introduced to support MULTI_ROLE capable
+  // frameworks. Frameworks that are not MULTI_ROLE capable can
+  // continue to assume that the offered resources are allocated
+  // to their role.
+  message AllocationInfo {
+    // If set, this resource is allocated to a role. Note that in the
+    // future, this may be unset and the scheduler may be responsible
+    // for allocating to one of its roles.
+    optional string role = 1;
+
+    // In the future, we may add additional fields here, e.g. priority
+    // tier, type of allocation (quota / fair share).
+  }
+
+  optional AllocationInfo allocation_info = 11;
+
+  // Resource Format:
+  //
+  // Frameworks receive resource offers in one of two formats, depending on
+  // whether the RESERVATION_REFINEMENT capability is enabled.
+  //
+  // __WITHOUT__ the RESERVATION_REFINEMENT capability, the framework is offered
+  // resources in the "pre-reservation-refinement" format. In this format, the
+  // `Resource.role` and `Resource.reservation` fields are used in conjunction
+  // to describe the reservation state of a `Resource` message.
+  //
+  // The following is an overview of the possible reservation states:
+  //
+  // +------------+------------------------------------------------------------+
+  // | unreserved | {                                                          |
+  // |            |   role: "*",                                               |
+  // |            |   reservation: <not set>,                                  |
+  // |            |   reservations: <unused>                                   |
+  // |            | }                                                          |
+  // +------------+------------------------------------------------------------+
+  // | static     | {                                                          |
+  // |            |   role: "eng",                                             |
+  // |            |   reservation: <not set>,                                  |
+  // |            |   reservations: <unused>                                   |
+  // |            | }                                                          |
+  // +------------+------------------------------------------------------------+
+  // | dynamic    | {                                                          |
+  // |            |   role: "eng",                                             |
+  // |            |   reservation: {                                           |
+  // |            |     type: <unused>,                                        |
+  // |            |     role: <unused>,                                        |
+  // |            |     principal: <optional>,                                 |
+  // |            |     labels: <optional>                                     |
+  // |            |   },                                                       |
+  // |            |   reservations: <unused>                                   |
+  // |            | }                                                          |
+  // +------------+------------------------------------------------------------+
+  //
+  // __WITH__ the RESERVATION_REFINEMENT capability, the framework is offered
+  // resources in the "post-reservation-refinement" format. In this format, the
+  // reservation state of a `Resource` message is expressed solely in
+  // `Resource.reservations` field.
+  //
+  // The following is an overview of the possible reservation states:
+  //
+  // +------------+------------------------------------------------------------+
+  // | unreserved | {                                                          |
+  // |            |   role: <unused>,                                          |
+  // |            |   reservation: <unused>,                                   |
+  // |            |   reservations: []                                         |
+  // |            | }                                                          |
+  // +------------+------------------------------------------------------------+
+  // | static     | {                                                          |
+  // |            |   role: <unused>,                                          |
+  // |            |   reservation: <unused>,                                   |
+  // |            |   reservations: [                                          |
+  // |            |     {                                                      |
+  // |            |       type: STATIC,                                        |
+  // |            |       role: "eng",                                         |
+  // |            |       principal: <optional>,                               |
+  // |            |       labels: <optional>                                   |
+  // |            |     }                                                      |
+  // |            |   ]                                                        |
+  // |            | }                                                          |
+  // +------------+------------------------------------------------------------+
+  // | dynamic    | {                                                          |
+  // |            |   role: <unused>,                                          |
+  // |            |   reservation: <unused>,                                   |
+  // |            |   reservations: [                                          |
+  // |            |     {                                                      |
+  // |            |       type: DYNAMIC,                                       |
+  // |            |       role: "eng",                                         |
+  // |            |       principal: <optional>,                               |
+  // |            |       labels: <optional>                                   |
+  // |            |     }                                                      |
+  // |            |   ]                                                        |
+  // |            | }                                                          |
+  // +------------+------------------------------------------------------------+
+  //
+  // We can also __refine__ reservations with this capability like so:
+  //
+  // +------------+------------------------------------------------------------+
+  // | refined    | {                                                          |
+  // |            |   role: <unused>,                                          |
+  // |            |   reservation: <unused>,                                   |
+  // |            |   reservations: [                                          |
+  // |            |     {                                                      |
+  // |            |       type: STATIC or DYNAMIC,                             |
+  // |            |       role: "eng",                                         |
+  // |            |       principal: <optional>,                               |
+  // |            |       labels: <optional>                                   |
+  // |            |     },                                                     |
+  // |            |     {                                                      |
+  // |            |       type: DYNAMIC,                                       |
+  // |            |       role: "eng/front_end",                               |
+  // |            |       principal: <optional>,                               |
+  // |            |       labels: <optional>                                   |
+  // |            |     }                                                      |
+  // |            |   ]                                                        |
+  // |            | }                                                          |
+  // +------------+------------------------------------------------------------+
+  //
+  // NOTE: Each `ReservationInfo` in the `reservations` field denotes
+  //       a reservation that refines the previous `ReservationInfo`.
+
+  message ReservationInfo {
+    // TODO(mpark): Explain the two resource formats.
+
+    // Describes a reservation. A static reservation is set by the operator on
+    // the command-line and they are immutable without agent restart. A dynamic
+    // reservation is acquired by an operator via the '/reserve' HTTP endpoint
+    // or by a framework via the offer cycle by sending back an
+    // 'Offer::Operation::Reserve' message.
+    // NOTE: We currently do not allow frameworks with role "*" to make dynamic
+    // reservations.
+
+    enum Type {
+      UNKNOWN = 0;
+      STATIC = 1;
+      DYNAMIC = 2;
+    }
+
+    // The type of this reservation.
+    // NOTE: This field must not be set for `Resource.reservation`.
+    optional Type type = 4;
+
+    // The role to which this reservation is made for.
+    // NOTE: This field must not be set for `Resource.reservation`.
+    optional string role = 3;
+
+    // Indicates the principal, if any, of the framework or operator
+    // that reserved this resource. If reserved by a framework, the
+    // field should match the `FrameworkInfo.principal`. It is used in
+    // conjunction with the `UnreserveResources` ACL to determine
+    // whether the entity attempting to unreserve this resource is
+    // permitted to do so.
+    optional string principal = 1;
+
+  }
+
+  // If this is set, this resource was dynamically reserved by an
+  // operator or a framework. Otherwise, this resource is either unreserved
+  // or statically reserved by an operator via the --resources flag.
+  // NOTE: Frameworks must not set this field if `reservations` is set.
+  optional ReservationInfo reservation = 8;
+
+  // The stack of reservations. If this field is empty, it indicates that this
+  // resource is unreserved. Otherwise, the resource is reserved. The first
+  // `ReservationInfo` may have type `STATIC` or `DYNAMIC`, but the rest must
+  // have `DYNAMIC`. One can create a new reservation on top of an existing
+  // one by pushing a new `ReservationInfo` to the back. The last
+  // `ReservationInfo` in this stack is the "current" reservation. The new
+  // reservation's role must be a child of the current reservation's role.
+  // NOTE: Frameworks must not set this field if `reservation` is set.
+  repeated ReservationInfo reservations = 13;  // EXPERIMENTAL.
+
+  message DiskInfo {
+    // Describes a persistent disk volume.
+    //
+    // A persistent disk volume will not be automatically garbage
+    // collected if the task/executor/agent terminates, but will be
+    // re-offered to the framework(s) belonging to the 'role'.
+    //
+    // NOTE: Currently, we do not allow persistent disk volumes
+    // without a reservation (i.e., 'role' cannot be '*').
+    message Persistence {
+      // A unique ID for the persistent disk volume. This ID must be
+      // unique per role on each agent. Although it is possible to use
+      // the same ID on different agents in the cluster and to reuse
+      // IDs after a volume with that ID has been destroyed, both
+      // practices are discouraged.
+      required string id = 1;
+
+      // This field indicates the principal of the operator or
+      // framework that created this volume. It is used in conjunction
+      // with the "destroy" ACL to determine whether an entity
+      // attempting to destroy the volume is permitted to do so.
+      //
+      // NOTE: This field should match the FrameworkInfo.principal of
+      // the framework that created the volume.
+      optional string principal = 2;
+    }
+
+    // Describes where a disk originates from.
+    // TODO(jmlvanre): Add support for BLOCK devices.
+    message Source {
+      enum Type {
+        UNKNOWN = 0;
+        PATH = 1;
+        MOUNT = 2;
+      }
+
+      // A folder that can be located on a separate disk device. This
+      // can be shared and carved up as necessary between frameworks.
+      message Path {
+        // Path to the folder (e.g., /mnt/raid/disk0).
+        optional string root = 1;
+      }
+
+      // A mounted file-system set up by the Agent administrator. This
+      // can only be used exclusively: a framework cannot accept a
+      // partial amount of this disk.
+      message Mount {
+        // Path to mount point (e.g., /mnt/raid/disk0).
+        optional string root = 1;
+      }
+
+      required Type type = 1;
+      optional Path path = 2;
+      optional Mount mount = 3;
+    }
+
+    optional Source source = 3;
+  }
+
+  optional DiskInfo disk = 7;
+
+  message RevocableInfo {}
+
+  // If this is set, the resources are revocable, i.e., any tasks or
+  // executors launched using these resources could get preempted or
+  // throttled at any time. This could be used by frameworks to run
+  // best effort tasks that do not need strict uptime or performance
+  // guarantees. Note that if this is set, 'disk' or 'reservation'
+  // cannot be set.
+  optional RevocableInfo revocable = 9;
+
+  // Allow the resource to be shared across tasks.
+  message SharedInfo {}
+
+  // If this is set, the resources are shared, i.e. multiple tasks
+  // can be launched using this resource and all of them shall refer
+  // to the same physical resource on the cluster. Note that only
+  // persistent volumes can be shared currently.
+  optional SharedInfo shared = 10;
+}
+message Filters {
+  // Time to consider unused resources refused. Note that all unused
+  // resources will be considered refused and use the default value
+  // (below) regardless of whether Filters was passed to
+  // SchedulerDriver::launchTasks. You MUST pass Filters with this
+  // field set to change this behavior (i.e., get another offer which
+  // includes unused resources sooner or later than the default).
+  optional double refuse_seconds = 1 [default = 5.0];
+}
+
+message FrameworkID {
+  required string value = 1;
+}
+
+message TaskID {
+  required string value = 1;
+}
+
+message Parameter {
+  required string key = 1;
+  required string value = 2;
+}
+
+message Event {
+  // Possible event types, followed by message definitions if
+  // applicable.
+  enum Type {
+    // This must be the first enum value in this list, to
+    // ensure that if 'type' is not set, the default value
+    // is UNKNOWN. This enables enum values to be added
+    // in a backwards-compatible way. See: MESOS-4997.
+    UNKNOWN = 0;
+
+    SUBSCRIBED = 1;             // See 'Subscribed' below.
+    OFFERS = 2;                 // See 'Offers' below.
+    INVERSE_OFFERS = 9;         // See 'InverseOffers' below.
+    RESCIND = 3;                // See 'Rescind' below.
+    RESCIND_INVERSE_OFFER = 10; // See 'RescindInverseOffer' below.
+    UPDATE = 4;                 // See 'Update' below.
+    MESSAGE = 5;                // See 'Message' below.
+    FAILURE = 6;                // See 'Failure' below.
+    ERROR = 7;                  // See 'Error' below.
+
+    // Periodic message sent by the Mesos master according to
+    // 'Subscribed.heartbeat_interval_seconds'. If the scheduler does
+    // not receive any events (including heartbeats) for an extended
+    // period of time (e.g., 5 x heartbeat_interval_seconds), there is
+    // likely a network partition. In such a case the scheduler should
+    // close the existing subscription connection and resubscribe
+    // using a backoff strategy.
+    HEARTBEAT = 8;
+  }
+
+  // First event received when the scheduler subscribes.
+  message Subscribed {
+    required FrameworkID framework_id = 1;
+
+    // This value will be set if the master is sending heartbeats. See
+    // the comment above on 'HEARTBEAT' for more details.
+    optional double heartbeat_interval_seconds = 2;
+
+    // Since Mesos 1.1.
+    optional MasterInfo master_info = 3;
+  }
+
+  // Received whenever there are new resources that are offered to the
+  // scheduler. Each offer corresponds to a set of resources on an
+  // agent. Until the scheduler accepts or declines an offer the
+  // resources are considered allocated to the scheduler.
+  message Offers {
+    repeated Offer offers = 1;
+  }
+
+  // Received whenever there are resources requested back from the
+  // scheduler. Each inverse offer specifies the agent, and
+  // optionally specific resources. Accepting or Declining an inverse
+  // offer informs the allocator of the scheduler's ability to release
+  // the specified resources without violating an SLA. If no resources
+  // are specified then all resources on the agent are requested to be
+  // released.
+  message InverseOffers {
+    repeated InverseOffer inverse_offers = 1;
+  }
+
+  // Received when a particular offer is no longer valid (e.g., the
+  // slave corresponding to the offer has been removed) and hence
+  // needs to be rescinded. Any future calls ('Accept' / 'Decline') made
+  // by the scheduler regarding this offer will be invalid.
+  message Rescind {
+    required OfferID offer_id = 1;
+  }
+
+  // Received when a particular inverse offer is no longer valid
+  // (e.g., the agent corresponding to the offer has been removed)
+  // and hence needs to be rescinded. Any future calls ('Accept' /
+  // 'Decline') made by the scheduler regarding this inverse offer
+  // will be invalid.
+  message RescindInverseOffer {
+    required OfferID inverse_offer_id = 1;
+  }
+
+  // Received whenever there is a status update that is generated by
+  // the executor or slave or master. Status updates should be used by
+  // executors to reliably communicate the status of the tasks that
+  // they manage. It is crucial that a terminal update (see TaskState
+  // in mesos.proto) is sent by the executor as soon as the task
+  // terminates, in order for Mesos to release the resources allocated
+  // to the task. It is also the responsibility of the scheduler to
+  // explicitly acknowledge the receipt of a status update. See
+  // 'Acknowledge' in the 'Call' section below for the semantics.
+  //
+  // A task status update may be used for guaranteed delivery of some
+  // task-related information, e.g., task's health update. Such
+  // information may be shadowed by subsequent task status updates, that
+  // do not preserve fields of the previously sent message.
+  message Update {
+    required TaskStatus status = 1;
+  }
+
+  // Received when a custom message generated by the executor is
+  // forwarded by the master. Note that this message is not
+  // interpreted by Mesos and is only forwarded (without reliability
+  // guarantees) to the scheduler. It is up to the executor to retry
+  // if the message is dropped for any reason.
+  message Message {
+    required SlaveID slave_id = 1;
+    required ExecutorID executor_id = 2;
+    required bytes data = 3;
+  }
+
+  // Received when a slave is removed from the cluster (e.g., failed
+  // health checks) or when an executor is terminated. Note that, this
+  // event coincides with receipt of terminal UPDATE events for any
+  // active tasks belonging to the slave or executor and receipt of
+  // 'Rescind' events for any outstanding offers belonging to the
+  // slave. Note that there is no guaranteed order between the
+  // 'Failure', 'Update' and 'Rescind' events when a slave or executor
+  // is removed.
+  // TODO(vinod): Consider splitting the lost slave and terminated
+  // executor into separate events and ensure it's reliably generated.
+  message Failure {
+    optional SlaveID slave_id = 1;
+
+    // If this was just a failure of an executor on a slave then
+    // 'executor_id' will be set and possibly 'status' (if we were
+    // able to determine the exit status).
+    optional ExecutorID executor_id = 2;
+
+    // On Posix, `status` corresponds to termination information in the
+    // `stat_loc` area returned from a `waitpid` call. On Windows, `status`
+    // is obtained via calling the `GetExitCodeProcess()` function. For
+    // messages coming from Posix agents, schedulers need to apply
+    // `WEXITSTATUS` family macros or equivalent transformations to obtain
+    // exit codes.
+    //
+    // TODO(alexr): Consider unifying Windows and Posix behavior by returning
+    // exit code here, see MESOS-7241.
+    optional int32 status = 3;
+  }
+
+  // Received when there is an unrecoverable error in the scheduler (e.g.,
+  // scheduler failed over, rate limiting, authorization errors etc.). The
+  // scheduler should abort on receiving this event.
+  message Error {
+    required string message = 1;
+  }
+
+  // Type of the event, indicates which optional field below should be
+  // present if that type has a nested message definition.
+  // Enum fields should be optional, see: MESOS-4997.
+  optional Type type = 1;
+
+  optional Subscribed subscribed = 2;
+  optional Offers offers = 3;
+  optional InverseOffers inverse_offers = 9;
+  optional Rescind rescind = 4;
+  optional RescindInverseOffer rescind_inverse_offer = 10;
+  optional Update update = 5;
+  optional Message message = 6;
+  optional Failure failure = 7;
+  optional Error error = 8;
+}
+message MasterInfo {
+  required string id = 1;
+
+  // The IP address (only IPv4) as a packed 4-bytes integer,
+  // stored in network order.  Deprecated, use `address.ip` instead.
+  required uint32 ip = 2;
+
+  // The TCP port the Master is listening on for incoming
+  // HTTP requests; deprecated, use `address.port` instead.
+  required uint32 port = 3 [default = 5050];
+
+  // In the default implementation, this will contain information
+  // about both the IP address, port and Master name; it should really
+  // not be relied upon by external tooling/frameworks and be
+  // considered an "internal" implementation field.
+  optional string pid = 4;
+
+  // The server's hostname, if available; it may be unreliable
+  // in environments where the DNS configuration does not resolve
+  // internal hostnames (eg, some public cloud providers).
+  // Deprecated, use `address.hostname` instead.
+  optional string hostname = 5;
+
+  // The running Master version, as a string; taken from the
+  // generated "master/version.hpp".
+  optional string version = 6;
+
+  // The full IP address (supports both IPv4 and IPv6 formats)
+  // and supersedes the use of `ip`, `port` and `hostname`.
+  // Since Mesos 0.24.
+  optional Address address = 7;
+
+  // The domain that this master belongs to. All masters in a Mesos
+  // cluster should belong to the same region.
+  optional DomainInfo domain = 8;
+}
+
+message InverseOffer {
+  // This is the same OfferID as found in normal offers, which allows
+  // re-use of some of the OfferID-only messages.
+  required OfferID id = 1;
+
+  // URL for reaching the agent running on the host.  This enables some
+  // optimizations as described in MESOS-3012, such as allowing the
+  // scheduler driver to bypass the master and talk directly with an agent.
+  optional URL url = 2;
+
+  // The framework that should release its resources.
+  // If no specifics are provided (i.e. which agent), all the framework's
+  // resources are requested back.
+  required FrameworkID framework_id = 3;
+
+  // Specified if the resources need to be released from a particular agent.
+  // All the framework's resources on this agent are requested back,
+  // unless further qualified by the `resources` field.
+  optional AgentID agent_id = 4;
+
+  // This InverseOffer represents a planned unavailability event in the
+  // specified interval.  Any tasks running on the given framework or agent
+  // may be killed when the interval arrives.  Therefore, frameworks should
+  // aim to gracefully terminate tasks prior to the arrival of the interval.
+  //
+  // For reserved resources, the resources are expected to be returned to the
+  // framework after the unavailability interval.  This is an expectation,
+  // not a guarantee.  For example, if the unavailability duration is not set,
+  // the resources may be removed permanently.
+  //
+  // For other resources, there is no guarantee that requested resources will
+  // be returned after the unavailability interval.  The allocator has no
+  // obligation to re-offer these resources to the prior framework after
+  // the unavailability.
+  required Unavailability unavailability = 5;
+
+  // A list of resources being requested back from the framework,
+  // on the agent identified by `agent_id`.  If no resources are specified
+  // then all resources are being requested back.  For the purpose of
+  // maintenance, this field is always empty (maintenance always requests
+  // all resources back).
+  repeated Resource resources = 6;
+
+  // TODO(josephw): Add additional options for narrowing down the resources
+  // being requested back.  Such as specific executors, tasks, etc.
+}
+
+message TaskStatus {
+  // Describes the source of the task status update.
+  enum Source {
+    SOURCE_MASTER = 0;
+    SOURCE_AGENT = 1;
+    SOURCE_EXECUTOR = 2;
+  }
+
+  // Detailed reason for the task status update.
+  //
+  // TODO(bmahler): Differentiate between agent removal reasons
+  // (e.g. unhealthy vs. unregistered for maintenance).
+  enum Reason {
+    // TODO(jieyu): The default value when a caller doesn't check for
+    // presence is 0 and so ideally the 0 reason is not a valid one.
+    // Since this is not used anywhere, consider removing this reason.
+    REASON_COMMAND_EXECUTOR_FAILED = 0;
+
+    REASON_CONTAINER_LAUNCH_FAILED = 21;
+    REASON_CONTAINER_LIMITATION = 19;
+    REASON_CONTAINER_LIMITATION_DISK = 20;
+    REASON_CONTAINER_LIMITATION_MEMORY = 8;
+    REASON_CONTAINER_PREEMPTED = 17;
+    REASON_CONTAINER_UPDATE_FAILED = 22;
+    REASON_EXECUTOR_REGISTRATION_TIMEOUT = 23;
+    REASON_EXECUTOR_REREGISTRATION_TIMEOUT = 24;
+    REASON_EXECUTOR_TERMINATED = 1;
+    REASON_EXECUTOR_UNREGISTERED = 2; // No longer used.
+    REASON_FRAMEWORK_REMOVED = 3;
+    REASON_GC_ERROR = 4;
+    REASON_INVALID_FRAMEWORKID = 5;
+    REASON_INVALID_OFFERS = 6;
+    REASON_IO_SWITCHBOARD_EXITED = 27;
+    REASON_MASTER_DISCONNECTED = 7;
+    REASON_RECONCILIATION = 9;
+    REASON_RESOURCES_UNKNOWN = 18;
+    REASON_AGENT_DISCONNECTED = 10;
+    REASON_AGENT_REMOVED = 11;
+    REASON_AGENT_RESTARTED = 12;
+    REASON_AGENT_UNKNOWN = 13;
+    REASON_TASK_KILLED_DURING_LAUNCH = 30;
+    REASON_TASK_CHECK_STATUS_UPDATED = 28;
+    REASON_TASK_HEALTH_CHECK_STATUS_UPDATED = 29;
+    REASON_TASK_GROUP_INVALID = 25;
+    REASON_TASK_GROUP_UNAUTHORIZED = 26;
+    REASON_TASK_INVALID = 14;
+    REASON_TASK_UNAUTHORIZED = 15;
+    REASON_TASK_UNKNOWN = 16;
+  }
+
+  required TaskID task_id = 1;
+  required TaskState state = 2;
+  optional string message = 4; // Possible message explaining state.
+  optional Source source = 9;
+  optional Reason reason = 10;
+  optional bytes data = 3;
+  optional AgentID agent_id = 5;
+  optional ExecutorID executor_id = 7; // TODO(benh): Use in master/agent.
+  optional double timestamp = 6;
+
+  // Statuses that are delivered reliably to the scheduler will
+  // include a 'uuid'. The status is considered delivered once
+  // it is acknowledged by the scheduler. Schedulers can choose
+  // to either explicitly acknowledge statuses or let the scheduler
+  // driver implicitly acknowledge (default).
+  //
+  // TODO(bmahler): This is currently overwritten in the scheduler
+  // driver and executor driver, but executors will need to set this
+  // to a valid RFC-4122 UUID if using the HTTP API.
+  optional bytes uuid = 11;
+
+  // Describes whether the task has been determined to be healthy (true) or
+  // unhealthy (false) according to the `health_check` field in `TaskInfo`.
+  optional bool healthy = 8;
+
+  // Contains check status for the check specified in the corresponding
+  // `TaskInfo`. If no check has been specified, this field must be
+  // absent, otherwise it must be present even if the check status is
+  // not available yet. If the status update is triggered for a different
+  // reason than `REASON_TASK_CHECK_STATUS_UPDATED`, this field will contain
+  // the last known value.
+  //
+  // NOTE: A check-related task status update is triggered if and only if
+  // the value or presence of any field in `CheckStatusInfo` changes.
+  //
+  // NOTE: Check support in built-in executors is experimental.
+  optional CheckStatusInfo check_status = 15;
+
+  // Labels are free-form key value pairs which are exposed through
+  // master and agent endpoints. Labels will not be interpreted or
+  // acted upon by Mesos itself. As opposed to the data field, labels
+  // will be kept in memory on master and agent processes. Therefore,
+  // labels should be used to tag TaskStatus message with light-weight
+  // meta-data.  Labels should not contain duplicate key-value pairs.
+  optional Labels labels = 12;
+
+  // Container related information that is resolved dynamically such as
+  // network address.
+  optional ContainerStatus container_status = 13;
+
+  // The time (according to the master's clock) when the agent where
+  // this task was running became unreachable. This is only set on
+  // status updates for tasks running on agents that are unreachable
+  // (e.g., partitioned away from the master).
+  optional TimeInfo unreachable_time = 14;
+}
+
+message ExecutorID {
+  required string value = 1;
+}
+
+message SlaveID {
+  required string value = 1;
+}
+
+message Address {
+  // May contain a hostname, IP address, or both.
+  optional string hostname = 1;
+  optional string ip = 2;
+
+  required int32 port = 3;
+}
+
+
+/**
+ * Represents a URL.
+ */
+message URL {
+  required string scheme = 1;
+  required Address address = 2;
+  optional string path = 3;
+  repeated Parameter query = 4;
+  optional string fragment = 5;
+}
+
+message TimeInfo {
+  required int64 nanoseconds = 1;
+}
+
+
+/**
+ * Represents duration in nanoseconds.
+ */
+message DurationInfo {
+  required int64 nanoseconds = 1;
+}
+message Unavailability {
+  required TimeInfo start = 1;
+
+  // When added to `start`, this represents the end of the interval.
+  // If unspecified, the duration is assumed to be infinite.
+  optional DurationInfo duration = 2;
+
+  // TODO(josephw): Add additional fields for expressing the purpose and
+  // urgency of the unavailability event.
+}
+message DomainInfo {
+  message FaultDomain {
+    message RegionInfo {
+      required string name = 1;
+    }
+
+    message ZoneInfo {
+      required string name = 1;
+    }
+
+    required RegionInfo region = 1;
+    required ZoneInfo zone = 2;
+  }
+
+  optional FaultDomain fault_domain = 1;
+}
+
+enum TaskState {
+  TASK_STAGING = 6;  // Initial state. Framework status updates should not use.
+  TASK_STARTING = 0; // The task is being launched by the executor.
+  TASK_RUNNING = 1;
+
+  // NOTE: This should only be sent when the framework has
+  // the TASK_KILLING_STATE capability.
+  TASK_KILLING = 8;  // The task is being killed by the executor.
+
+  TASK_FINISHED = 2; // TERMINAL: The task finished successfully.
+  TASK_FAILED = 3;   // TERMINAL: The task failed to finish successfully.
+  TASK_KILLED = 4;   // TERMINAL: The task was killed by the executor.
+  TASK_ERROR = 7;    // TERMINAL: The task description contains an error.
+
+  // In Mesos 1.3, this will only be sent when the framework does NOT
+  // opt-in to the PARTITION_AWARE capability.
+  //
+  // NOTE: This state is not always terminal. For example, tasks might
+  // transition from TASK_LOST to TASK_RUNNING or other states when a
+  // partitioned agent re-registers.
+  TASK_LOST = 5;     // The task failed but can be rescheduled.
+
+  // The following task states are only sent when the framework
+  // opts-in to the PARTITION_AWARE capability.
+
+  // The task failed to launch because of a transient error. The
+  // task's executor never started running. Unlike TASK_ERROR, the
+  // task description is valid -- attempting to launch the task again
+  // may be successful.
+  TASK_DROPPED = 9;  // TERMINAL.
+
+  // The task was running on an agent that has lost contact with the
+  // master, typically due to a network failure or partition. The task
+  // may or may not still be running.
+  TASK_UNREACHABLE = 10;
+
+  // The task is no longer running. This can occur if the agent has
+  // been terminated along with all of its tasks (e.g., the host that
+  // was running the agent was rebooted). It might also occur if the
+  // task was terminated due to an agent or containerizer error, or if
+  // the task was preempted by the QoS controller in an
+  // oversubscription scenario.
+  TASK_GONE = 11;    // TERMINAL.
+
+  // The task was running on an agent that the master cannot contact;
+  // the operator has asserted that the agent has been shutdown, but
+  // this has not been directly confirmed by the master. If the
+  // operator is correct, the task is not running and this is a
+  // terminal state; if the operator is mistaken, the task may still
+  // be running and might return to RUNNING in the future.
+  TASK_GONE_BY_OPERATOR = 12;
+
+  // The master has no knowledge of the task. This is typically
+  // because either (a) the master never had knowledge of the task, or
+  // (b) the master forgot about the task because it garbage collected
+  // its metadata about the task. The task may or may not still be
+  // running.
+  TASK_UNKNOWN = 13;
+}
+
+message CheckStatusInfo {
+  message Command {
+    // Exit code of a command check. It is the result of calling
+    // `WEXITSTATUS()` on `waitpid()` termination information on
+    // Posix and calling `GetExitCodeProcess()` on Windows.
+    optional int32 exit_code = 1;
+  }
+
+  message Http {
+    // HTTP status code of an HTTP check.
+    optional uint32 status_code = 1;
+  }
+
+  message Tcp {
+    // Whether a TCP connection succeeded.
+    optional bool succeeded = 1;
+  }
+
+  // TODO(alexr): Consider adding a `data` field, which can contain, e.g.,
+  // truncated stdout/stderr output for command checks or HTTP response body
+  // for HTTP checks. Alternatively, it can be an even shorter `message` field
+  // containing the last line of stdout or Reason-Phrase of the status line of
+  // the HTTP response.
+
+  // The type of the check this status corresponds to.
+  optional CheckInfo.Type type = 1;
+
+  // Status of a command check.
+  optional Command command = 2;
+
+  // Status of an HTTP check.
+  optional Http http = 3;
+
+  // Status of a TCP check.
+  optional Tcp tcp = 4;
+
+  // TODO(alexr): Consider introducing a "last changed at" timestamp, since
+  // task status update's timestamp may not correspond to the last check's
+  // state, e.g., for reconciliation.
+
+  // TODO(alexr): Consider introducing a `reason` enum here to explicitly
+  // distinguish between completed, delayed, and timed out checks.
+}
+
+message Labels {
+  repeated Label labels = 1;
+}
+
+
+/**
+ * Key, value pair used to store free form user-data.
+ */
+message Label {
+  required string key = 1;
+  optional string value = 2;
+}
+message ContainerStatus {
+  optional ContainerID container_id = 4;
+
+  // This field can be reliably used to identify the container IP address.
+  repeated NetworkInfo network_infos = 1;
+
+  // Information about Linux control group (cgroup).
+  optional CgroupInfo cgroup_info = 2;
+
+  // Information about Executor PID.
+  optional uint32 executor_pid = 3;
+}
+
+message CheckInfo {
+  enum Type {
+    UNKNOWN = 0;
+    COMMAND = 1;
+    HTTP = 2;
+    TCP = 3;
+
+    // TODO(alexr): Consider supporting custom user checks. They should
+    // probably be paired with a `data` field and complemented by a
+    // `data` response in `CheckStatusInfo`.
+  }
+
+  // Describes a command check. If applicable, enters mount and/or network
+  // namespaces of the task.
+  message Command {
+    required CommandInfo command = 1;
+  }
+
+  // Describes an HTTP check. Sends a GET request to
+  // http://<host>:port/path. Note that <host> is not configurable and is
+  // resolved automatically to 127.0.0.1.
+  message Http {
+    // Port to send the HTTP request.
+    required uint32 port = 1;
+
+    // HTTP request path.
+    optional string path = 2;
+
+    // TODO(alexr): Add support for HTTP method. While adding POST
+    // and PUT is simple, supporting payload is more involved.
+
+    // TODO(alexr): Add support for custom HTTP headers.
+
+    // TODO(alexr): Consider adding an optional message to describe TLS
+    // options and thus enabling https. Such message might contain certificate
+    // validation, TLS version.
+  }
+
+  // Describes a TCP check, i.e. based on establishing a TCP connection to
+  // the specified port. Note that <host> is not configurable and is resolved
+  // automatically to 127.0.0.1.
+  message Tcp {
+    required uint32 port = 1;
+  }
+
+  // The type of the check.
+  optional Type type = 1;
+
+  // Command check.
+  optional Command command = 2;
+
+  // HTTP check.
+  optional Http http = 3;
+
+  // TCP check.
+  optional Tcp tcp = 7;
+
+  // Amount of time to wait to start checking the task after it
+  // transitions to `TASK_RUNNING` or `TASK_STARTING` if the latter
+  // is used by the executor.
+  optional double delay_seconds = 4 [default = 15.0];
+
+  // Interval between check attempts, i.e., amount of time to wait after
+  // the previous check finished or timed out to start the next check.
+  optional double interval_seconds = 5 [default = 10.0];
+
+  // Amount of time to wait for the check to complete. Zero means infinite
+  // timeout.
+  //
+  // After this timeout, the check attempt is aborted and no result is
+  // reported. Note that this may be considered a state change and hence
+  // may trigger a check status change delivery to the corresponding
+  // scheduler. See `CheckStatusInfo` for more details.
+  optional double timeout_seconds = 6 [default = 20.0];
+}
+
+message ContainerID {
+  required string value = 1;
+  optional ContainerID parent = 2;
+}
+
+message NetworkInfo {
+  enum Protocol {
+    IPv4 = 1;
+    IPv6 = 2;
+  }
+
+  // Specifies a request for an IP address, or reports the assigned container
+  // IP address.
+  //
+  // Users can request an automatically assigned IP (for example, via an
+  // IPAM service) or a specific IP by adding a NetworkInfo to the
+  // ContainerInfo for a task.  On a request, specifying neither `protocol`
+  // nor `ip_address` means that any available address may be assigned.
+  message IPAddress {
+    // Specify IP address requirement. Set protocol to the desired value to
+    // request the network isolator on the Agent to assign an IP address to the
+    // container being launched. If a specific IP address is specified in
+    // ip_address, this field should not be set.
+    optional Protocol protocol = 1 [default = IPv4];
+
+    // Statically assigned IP provided by the Framework. This IP will be
+    // assigned to the container by the network isolator module on the Agent.
+    // This field should not be used with the protocol field above.
+    //
+    // If an explicit address is requested but is unavailable, the network
+    // isolator should fail the task.
+    optional string ip_address = 2;
+  }
+
+  // When included in a ContainerInfo, each of these represent a
+  // request for an IP address. Each request can specify an explicit address
+  // or the IP protocol to use.
+  //
+  // When included in a TaskStatus message, these inform the framework
+  // scheduler about the IP addresses that are bound to the container
+  // interface. When there are no custom network isolator modules installed,
+  // this field is filled in automatically with the Agent IP address.
+  repeated IPAddress ip_addresses = 5;
+
+  // Name of the network which will be used by network isolator to determine
+  // the network that the container joins. It's up to the network isolator
+  // to decide how to interpret this field.
+  optional string name = 6;
+
+  // A group is the name given to a set of logically-related interfaces that
+  // are allowed to communicate among themselves. Network traffic is allowed
+  // between two container interfaces that share at least one network group.
+  // For example, one might want to create separate groups for isolating dev,
+  // testing, qa and prod deployment environments.
+  repeated string groups = 3;
+
+  // To tag certain metadata to be used by Isolator/IPAM, e.g., rack, etc.
+  optional Labels labels = 4;
+
+  // Specifies a port mapping request for the task on this network.
+  message PortMapping {
+    required uint32 host_port = 1;
+    required uint32 container_port = 2;
+    // Protocol to expose as (ie: tcp, udp).
+    optional string protocol = 3;
+  }
+
+  repeated PortMapping port_mappings = 7;
+};
+
+message CgroupInfo {
+  // Configuration of a blkio cgroup subsystem.
+  message Blkio {
+    enum Operation {
+      UNKNOWN = 0;
+      TOTAL = 1;
+      READ = 2;
+      WRITE = 3;
+      SYNC = 4;
+      ASYNC = 5;
+    }
+
+    // Describes a stat value without the device descriptor part.
+    message Value {
+      optional Operation op = 1; // Required.
+      optional uint64 value = 2; // Required.
+    }
+
+    message CFQ {
+      message Statistics {
+        // Stats are grouped by block devices. If `device` is not
+        // set, it represents `Total`.
+        optional Device.Number device = 1;
+        // blkio.sectors
+        optional uint64 sectors = 2;
+        // blkio.time
+        optional uint64 time = 3;
+        // blkio.io_serviced
+        repeated Value io_serviced = 4;
+        // blkio.io_service_bytes
+        repeated Value io_service_bytes = 5;
+        // blkio.io_service_time
+        repeated Value io_service_time = 6;
+        // blkio.io_wait_time
+        repeated Value io_wait_time = 7;
+        // blkio.io_merged
+        repeated Value io_merged = 8;
+        // blkio.io_queued
+        repeated Value io_queued = 9;
+      }
+
+      // TODO(jasonlai): Add fields for blkio weight and weight
+      // device.
+    }
+
+    message Throttling {
+      message Statistics {
+        // Stats are grouped by block devices. If `device` is not
+        // set, it represents `Total`.
+        optional Device.Number device = 1;
+        // blkio.throttle.io_serviced
+        repeated Value io_serviced = 2;
+        // blkio.throttle.io_service_bytes
+        repeated Value io_service_bytes = 3;
+      }
+
+      // TODO(jasonlai): Add fields for blkio.throttle.*_device.
+    }
+
+    message Statistics {
+      repeated CFQ.Statistics cfq = 1;
+      repeated CFQ.Statistics cfq_recursive = 2;
+      repeated Throttling.Statistics throttling = 3;
+    }
+  }
+
+  // Configuration of a net_cls cgroup subsystem.
+  message NetCls {
+    // The 32-bit classid consists of two parts, a 16 bit major handle
+    // and a 16-bit minor handle. The major and minor handle are
+    // represented using the format 0xAAAABBBB, where 0xAAAA is the
+    // 16-bit major handle and 0xBBBB is the 16-bit minor handle.
+    optional uint32 classid = 1;
+  }
+
+  optional NetCls net_cls = 1;
+}
+message Device {
+  message Number {
+    required uint64 major_number = 1;
+    required uint64 minor_number = 2;
+  }
+
+  optional string path = 1;
+  optional Number number = 2;
 }
