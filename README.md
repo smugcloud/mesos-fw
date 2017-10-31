@@ -17,7 +17,7 @@ Usage:
 
 Available Commands:
   help        Help about any command
-  launch      A brief description of your command
+  launch      Launch a Docker image
 
 Flags:
   -h, --help   help for mesos-fw
